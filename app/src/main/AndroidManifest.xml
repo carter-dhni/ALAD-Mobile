@@ -7,6 +7,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
@@ -39,11 +40,28 @@
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
             
         <service android:name=".core.service.AudioDubbingForegroundService"
-            android:foregroundServiceType="mediaProjection|mediaPlayback"
+            android:foregroundServiceType="mediaProjection|mediaPlayback|microphone"
             android:exported="false" />
             
         <service android:name=".core.service.OverlayWidgetService"
             android:exported="false" />
+
+        <service android:name=".core.service.SubtitleOverlayService"
+            android:exported="false" />
+
+        <service
+            android:name=".core.service.DubTileService"
+            android:label="@string/tile_label"
+            android:icon="@mipmap/ic_launcher"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.service.quicksettings.TOGGLEABLE_TILE"
+                android:value="true" />
+        </service>
     </application>
 
 </manifest>

@@ -25,6 +25,14 @@ class MainViewModel(private val repository: UserPreferencesRepository) : ViewMod
     val targetLang: StateFlow<String> = repository.targetLangFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), "fa")
 
+    val liteMode: StateFlow<Boolean> = repository.liteModeFlow
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+    val shadowMode: StateFlow<Boolean> = repository.shadowModeFlow
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+    val audioSource: StateFlow<String> = repository.audioSourceFlow
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000),
+            UserPreferencesRepository.AUDIO_SOURCE_INTERNAL)
+
     fun updateSourceLang(lang: String) {
         viewModelScope.launch { repository.updateSourceLang(lang) }
     }

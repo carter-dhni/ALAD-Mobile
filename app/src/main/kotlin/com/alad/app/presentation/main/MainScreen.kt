@@ -235,6 +235,39 @@ fun MainScreen(
                     modifier = Modifier.fillMaxWidth()
                 )
 
+                // Active mode badges (Lite / Shadow / Around-me)
+                val liteMode by viewModel.liteMode.collectAsState()
+                val shadowMode by viewModel.shadowMode.collectAsState()
+                val audioSource by viewModel.audioSource.collectAsState()
+                val badges = buildList {
+                    if (liteMode) add(stringResource(R.string.badge_lite) to NeonCyan)
+                    if (shadowMode) add(stringResource(R.string.badge_shadow) to NeonPurple)
+                    if (audioSource == com.alad.app.data.repository.UserPreferencesRepository.AUDIO_SOURCE_MIC) {
+                        add(stringResource(R.string.badge_mic) to NeonCoral)
+                    }
+                }
+                if (badges.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 8.dp),
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        badges.forEachIndexed { i, (label, color) ->
+                            if (i > 0) Spacer(modifier = Modifier.width(8.dp))
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(color.copy(alpha = 0.15f))
+                                    .border(1.dp, color.copy(alpha = 0.5f), RoundedCornerShape(10.dp))
+                                    .padding(horizontal = 10.dp, vertical = 4.dp)
+                            ) {
+                                Text(label, color = color, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                }
+
                 // Neon Audio Waveform Visualizer
                 AnimatedWaveform(
                     isConnected = isConnected,

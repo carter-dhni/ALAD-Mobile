@@ -36,7 +36,7 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
-            startDubbingService(result.resultCode, result.data!!)
+            startDubbingService(result.resultCode, result.data!!, false)
             mainViewModel.updateStatus("Connected")
         } else {
             Toast.makeText(this, "Screen capture permission denied", Toast.LENGTH_SHORT).show()
@@ -49,7 +49,7 @@ class MainActivity : ComponentActivity() {
     ) { permissions ->
         val audioGranted = permissions[Manifest.permission.RECORD_AUDIO] == true
         if (audioGranted) {
-            launchScreenCapture()
+            onAudioPermissionGranted()
         } else {
             Toast.makeText(this, "Audio permission is required", Toast.LENGTH_SHORT).show()
             mainViewModel.updateStatus("Disconnected")
@@ -107,9 +107,24 @@ class MainActivity : ComponentActivity() {
         }
 
         if (missingPermissions.isEmpty()) {
-            launchScreenCapture()
+            onAudioPermissionGranted()
         } else {
             permissionLauncher.launch(missingPermissions.toTypedArray())
+        }
+    }
+
+    private fun onAudioPermissionGranted() {
+        // Around-me (mic) mode needs no screen-capture permission at all.
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
+            val repository = UserPreferencesRepository(applicationContext)
+            val useMic = kotlinx.coroutines.flow.first(repository.audioSourceFlow) ==
+                UserPreferencesRepository.AUDIO_SOURCE_MIC
+            if (useMic) {
+                startDubbingService(0, null, useMic)
+                mainViewModel.updateStatus("Connected")
+            } else {
+                launchScreenCapture()
+            }
         }
     }
 
@@ -118,11 +133,18 @@ class MainActivity : ComponentActivity() {
         screenCaptureLauncher.launch(mediaProjectionManager.createScreenCaptureIntent())
     }
 
-    private fun startDubbingService(resultCode: Int, data: Intent) {
+    private fun startDubbingService(resultCode: Int, data: Intent?, useMic: Boolean) {
         val intent = Intent(this, AudioDubbingForegroundService::class.java).apply {
             action = AudioDubbingForegroundService.ACTION_START
             putExtra(AudioDubbingForegroundService.EXTRA_RESULT_CODE, resultCode)
-            putExtra(AudioDubbingForegroundService.EXTRA_RESULT_DATA, data)
+            putExtra(
+                AudioDubbingForegroundService.EXTRA_AUDIO_SOURCE,
+                if (useMic) UserPreferencesRepository.AUDIO_SOURCE_MIC
+                else UserPreferencesRepository.AUDIO_SOURCE_INTERNAL
+            )
+            if (data != null) {
+                putExtra(AudioDubbingForegroundService.EXTRA_RESULT_DATA, data)
+            }
         }
         ContextCompat.startForegroundService(this, intent)
     }

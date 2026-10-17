@@ -1,0 +1,2125 @@
+diff -ruN '--exclude=build' '--exclude=.gradle' ALAD-Mobile-main/app/src/main/AndroidManifest.xml ALAD-Mobile-pazhvak/app/src/main/AndroidManifest.xml
+--- ALAD-Mobile-main/app/src/main/AndroidManifest.xml	2026-08-28 19:18:21.000000000 +0330
++++ ALAD-Mobile-pazhvak/app/src/main/AndroidManifest.xml	2026-10-17 22:10:32.696568786 +0330
+@@ -7,6 +7,7 @@
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
++    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+ 
+@@ -39,11 +40,28 @@
+             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+             
+         <service android:name=".core.service.AudioDubbingForegroundService"
+-            android:foregroundServiceType="mediaProjection|mediaPlayback"
++            android:foregroundServiceType="mediaProjection|mediaPlayback|microphone"
+             android:exported="false" />
+             
+         <service android:name=".core.service.OverlayWidgetService"
+             android:exported="false" />
++
++        <service android:name=".core.service.SubtitleOverlayService"
++            android:exported="false" />
++
++        <service
++            android:name=".core.service.DubTileService"
++            android:label="@string/tile_label"
++            android:icon="@mipmap/ic_launcher"
++            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
++            android:exported="true">
++            <intent-filter>
++                <action android:name="android.service.quicksettings.action.QS_TILE" />
++            </intent-filter>
++            <meta-data
++                android:name="android.service.quicksettings.TOGGLEABLE_TILE"
++                android:value="true" />
++        </service>
+     </application>
+ 
+ </manifest>
+diff -ruN '--exclude=build' '--exclude=.gradle' ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/MainActivity.kt ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/MainActivity.kt
+--- ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/MainActivity.kt	2026-08-28 19:18:21.000000000 +0330
++++ ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/MainActivity.kt	2026-10-17 22:10:32.705559262 +0330
+@@ -36,7 +36,7 @@
+         ActivityResultContracts.StartActivityForResult()
+     ) { result ->
+         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+-            startDubbingService(result.resultCode, result.data!!)
++            startDubbingService(result.resultCode, result.data!!, false)
+             mainViewModel.updateStatus("Connected")
+         } else {
+             Toast.makeText(this, "Screen capture permission denied", Toast.LENGTH_SHORT).show()
+@@ -49,7 +49,7 @@
+     ) { permissions ->
+         val audioGranted = permissions[Manifest.permission.RECORD_AUDIO] == true
+         if (audioGranted) {
+-            launchScreenCapture()
++            onAudioPermissionGranted()
+         } else {
+             Toast.makeText(this, "Audio permission is required", Toast.LENGTH_SHORT).show()
+             mainViewModel.updateStatus("Disconnected")
+@@ -107,22 +107,44 @@
+         }
+ 
+         if (missingPermissions.isEmpty()) {
+-            launchScreenCapture()
++            onAudioPermissionGranted()
+         } else {
+             permissionLauncher.launch(missingPermissions.toTypedArray())
+         }
+     }
+ 
++    private fun onAudioPermissionGranted() {
++        // Around-me (mic) mode needs no screen-capture permission at all.
++        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
++            val repository = UserPreferencesRepository(applicationContext)
++            val useMic = kotlinx.coroutines.flow.first(repository.audioSourceFlow) ==
++                UserPreferencesRepository.AUDIO_SOURCE_MIC
++            if (useMic) {
++                startDubbingService(0, null, useMic)
++                mainViewModel.updateStatus("Connected")
++            } else {
++                launchScreenCapture()
++            }
++        }
++    }
++
+     private fun launchScreenCapture() {
+         val mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+         screenCaptureLauncher.launch(mediaProjectionManager.createScreenCaptureIntent())
+     }
+ 
+-    private fun startDubbingService(resultCode: Int, data: Intent) {
++    private fun startDubbingService(resultCode: Int, data: Intent?, useMic: Boolean) {
+         val intent = Intent(this, AudioDubbingForegroundService::class.java).apply {
+             action = AudioDubbingForegroundService.ACTION_START
+             putExtra(AudioDubbingForegroundService.EXTRA_RESULT_CODE, resultCode)
+-            putExtra(AudioDubbingForegroundService.EXTRA_RESULT_DATA, data)
++            putExtra(
++                AudioDubbingForegroundService.EXTRA_AUDIO_SOURCE,
++                if (useMic) UserPreferencesRepository.AUDIO_SOURCE_MIC
++                else UserPreferencesRepository.AUDIO_SOURCE_INTERNAL
++            )
++            if (data != null) {
++                putExtra(AudioDubbingForegroundService.EXTRA_RESULT_DATA, data)
++            }
+         }
+         ContextCompat.startForegroundService(this, intent)
+     }
+diff -ruN '--exclude=build' '--exclude=.gradle' ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/TransparentCaptureActivity.kt ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/TransparentCaptureActivity.kt
+--- ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/TransparentCaptureActivity.kt	2026-08-28 19:18:21.000000000 +0330
++++ ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/TransparentCaptureActivity.kt	2026-10-17 22:10:32.707169337 +0330
+@@ -9,7 +9,11 @@
+ import androidx.activity.ComponentActivity
+ import androidx.activity.result.contract.ActivityResultContracts
+ import androidx.core.content.ContextCompat
++import androidx.lifecycle.lifecycleScope
+ import com.alad.app.core.service.AudioDubbingForegroundService
++import com.alad.app.data.repository.UserPreferencesRepository
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.launch
+ 
+ class TransparentCaptureActivity : ComponentActivity() {
+ 
+@@ -17,7 +21,7 @@
+         ActivityResultContracts.StartActivityForResult()
+     ) { result ->
+         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+-            startDubbingService(result.resultCode, result.data!!)
++            startDubbingService(result.resultCode, result.data, false)
+         } else {
+             Toast.makeText(this, "Screen capture permission denied", Toast.LENGTH_SHORT).show()
+         }
+@@ -26,16 +30,35 @@
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+-        
+-        val mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+-        screenCaptureLauncher.launch(mediaProjectionManager.createScreenCaptureIntent())
++
++        // Around-me (mic) mode needs no screen-capture permission at all.
++        lifecycleScope.launch {
++            val repository = UserPreferencesRepository(applicationContext)
++            val useMic = repository.audioSourceFlow.first() ==
++                UserPreferencesRepository.AUDIO_SOURCE_MIC
++            if (useMic) {
++                startDubbingService(0, null, true)
++                finish()
++            } else {
++                val mediaProjectionManager =
++                    getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
++                screenCaptureLauncher.launch(mediaProjectionManager.createScreenCaptureIntent())
++            }
++        }
+     }
+ 
+-    private fun startDubbingService(resultCode: Int, data: Intent) {
++    private fun startDubbingService(resultCode: Int, data: Intent?, useMic: Boolean) {
+         val intent = Intent(this, AudioDubbingForegroundService::class.java).apply {
+             action = AudioDubbingForegroundService.ACTION_START
+             putExtra(AudioDubbingForegroundService.EXTRA_RESULT_CODE, resultCode)
+-            putExtra(AudioDubbingForegroundService.EXTRA_RESULT_DATA, data)
++            putExtra(
++                AudioDubbingForegroundService.EXTRA_AUDIO_SOURCE,
++                if (useMic) UserPreferencesRepository.AUDIO_SOURCE_MIC
++                else UserPreferencesRepository.AUDIO_SOURCE_INTERNAL
++            )
++            if (data != null) {
++                putExtra(AudioDubbingForegroundService.EXTRA_RESULT_DATA, data)
++            }
+         }
+         ContextCompat.startForegroundService(this, intent)
+     }
+diff -ruN '--exclude=build' '--exclude=.gradle' ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/core/audio/AudioCaptureManager.kt ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/core/audio/AudioCaptureManager.kt
+--- ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/core/audio/AudioCaptureManager.kt	2026-08-28 19:18:21.000000000 +0330
++++ ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/core/audio/AudioCaptureManager.kt	2026-10-17 22:10:32.709016538 +0330
+@@ -70,9 +70,49 @@
+         }
+     }
+ 
++    /**
++     * "Around-me" mode: capture from the microphone instead of internal playback,
++     * for translating the room / people around the phone.
++     */
++    @SuppressLint("MissingPermission")
++    fun startMicCapture(onAudioData: (ByteArray) -> Unit) {
++        if (isRecording) return
++
++        try {
++            val format = AudioFormat.Builder()
++                .setEncoding(AUDIO_FORMAT)
++                .setSampleRate(SAMPLE_RATE)
++                .setChannelMask(CHANNEL_CONFIG)
++                .build()
++
++            audioRecord = AudioRecord.Builder()
++                .setAudioSource(android.media.MediaRecorder.AudioSource.MIC)
++                .setAudioFormat(format)
++                .setBufferSizeInBytes(BUFFER_SIZE)
++                .build()
++
++            audioRecord?.startRecording()
++            isRecording = true
++
++            Thread {
++                val buffer = ByteArray(BUFFER_SIZE)
++                while (isRecording) {
++                    val read = audioRecord?.read(buffer, 0, buffer.size) ?: 0
++                    if (read > 0) {
++                        onAudioData(buffer.copyOf(read))
++                    }
++                }
++            }.start()
++        } catch (e: Exception) {
++            Log.e(TAG, "Error starting mic capture", e)
++        }
++    }
++
+     fun stopCapture() {
+         isRecording = false
+-        audioRecord?.stop()
++        try {
++            audioRecord?.stop()
++        } catch (_: Exception) { }
+         audioRecord?.release()
+         audioRecord = null
+     }
+diff -ruN '--exclude=build' '--exclude=.gradle' ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/core/network/ALADWebSocketManager.kt ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/core/network/ALADWebSocketManager.kt
+--- ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/core/network/ALADWebSocketManager.kt	2026-08-28 19:18:21.000000000 +0330
++++ ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/core/network/ALADWebSocketManager.kt	2026-10-17 22:10:32.710559262 +0330
+@@ -7,52 +7,107 @@
+ import org.json.JSONArray
+ import org.json.JSONObject
+ 
++/** Which side of the conversation a transcript belongs to. */
++enum class TranscriptKind { INPUT, OUTPUT }
++
++/** Dubbing strategy: full voice dubbing, or text-only subtitles (low data). */
++enum class StreamMode { DUB, LITE }
++
+ class ALADWebSocketManager(private val client: OkHttpClient) {
+     private var webSocket: WebSocket? = null
+     var onBinaryMessageReceived: ((ByteArray) -> Unit)? = null
+     var onStatusChanged: ((String) -> Unit)? = null
++    /** Fired for incremental input/output transcripts (subtitles, shadowing). */
++    var onTranscriptReceived: ((TranscriptKind, String) -> Unit)? = null
++    /** Fired when the model signals the end of a spoken turn (sentence boundary). */
++    var onTurnComplete: (() -> Unit)? = null
+ 
+     companion object {
+         private const val TAG = "ALADWebSocketManager"
+         private const val GEMINI_WS_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
++        private const val LIVE_TRANSLATE_MODEL = "models/gemini-3.5-live-translate-preview"
+     }
+ 
+-    private var isGeminiConnection = true
+     private var isSetupComplete = false
++    private var currentMode: StreamMode = StreamMode.DUB
++
++    /**
++     * @param enableTranscription request input/output audio transcriptions alongside
++     *        dubbed audio (powers floating subtitles, karaoke and shadowing).
++     */
++    fun connect(
++        apiKey: String,
++        targetLang: String,
++        mode: StreamMode = StreamMode.DUB,
++        enableTranscription: Boolean = true
++    ) {
++        // Kept for source compatibility with the old (apiKey, sourceLang, targetLang) call shape.
++        connect(apiKey, "", targetLang, mode, enableTranscription)
++    }
+ 
+-    fun connect(apiKey: String, sourceLang: String, targetLang: String) {
++    fun connect(
++        apiKey: String,
++        @Suppress("UNUSED_PARAMETER") sourceLang: String,
++        targetLang: String,
++        mode: StreamMode = StreamMode.DUB,
++        enableTranscription: Boolean = true
++    ) {
++        currentMode = mode
+         val finalUrl = "$GEMINI_WS_URL?key=$apiKey"
+         val request = Request.Builder().url(finalUrl).build()
+         isSetupComplete = false
+-        
++
+         webSocket = client.newWebSocket(request, object : WebSocketListener() {
+             override fun onOpen(webSocket: WebSocket, response: Response) {
+                 Log.d(TAG, "Connected to Gemini Live API")
+                 onStatusChanged?.invoke("Connected")
+-                sendGeminiSetup(targetLang)
++                sendGeminiSetup(targetLang, mode, enableTranscription)
+             }
+ 
+             override fun onMessage(webSocket: WebSocket, text: String) {
+-                Log.d(TAG, "Raw message: $text")
+                 try {
+                     val json = JSONObject(text)
+-                    
++
+                     if (json.has("serverContent") || json.has("server_content")) {
+-                        val serverContent = json.optJSONObject("serverContent") ?: json.optJSONObject("server_content")
+-                        if (serverContent != null && (serverContent.has("modelTurn") || serverContent.has("model_turn"))) {
+-                            val modelTurn = serverContent.optJSONObject("modelTurn") ?: serverContent.optJSONObject("model_turn")
++                        val serverContent = json.optJSONObject("serverContent")
++                            ?: json.optJSONObject("server_content")
++                        if (serverContent != null) {
++                            // 1) Audio chunks (dubbed voice)
++                            val modelTurn = serverContent.optJSONObject("modelTurn")
++                                ?: serverContent.optJSONObject("model_turn")
+                             val parts = modelTurn?.optJSONArray("parts")
+                             if (parts != null) {
+                                 for (i in 0 until parts.length()) {
+                                     val part = parts.getJSONObject(i)
+-                                    val inlineData = part.optJSONObject("inlineData") ?: part.optJSONObject("inline_data")
++                                    val inlineData = part.optJSONObject("inlineData")
++                                        ?: part.optJSONObject("inline_data")
+                                     if (inlineData != null) {
+                                         val base64Data = inlineData.getString("data")
+                                         val audioBytes = Base64.decode(base64Data, Base64.DEFAULT)
+                                         onBinaryMessageReceived?.invoke(audioBytes)
+                                     }
++                                    // 2) Text parts (lite / text-only mode)
++                                    val textPart = part.optString("text", null)
++                                    if (textPart != null) {
++                                        onTranscriptReceived?.invoke(TranscriptKind.OUTPUT, textPart)
++                                    }
+                                 }
+                             }
++                            // 3) Incremental transcriptions (when requested in setup)
++                            val inputTr = serverContent.optJSONObject("inputTranscription")
++                                ?: serverContent.optJSONObject("input_transcription")
++                            inputTr?.optString("text", null)?.let {
++                                onTranscriptReceived?.invoke(TranscriptKind.INPUT, it)
++                            }
++                            val outputTr = serverContent.optJSONObject("outputTranscription")
++                                ?: serverContent.optJSONObject("output_transcription")
++                            outputTr?.optString("text", null)?.let {
++                                onTranscriptReceived?.invoke(TranscriptKind.OUTPUT, it)
++                            }
++                            // 4) Turn boundary -> sentence boundary for shadowing
++                            val turnComplete = serverContent.optBoolean("turnComplete",
++                                serverContent.optBoolean("turn_complete", false))
++                            if (turnComplete) onTurnComplete?.invoke()
+                         }
+                     } else if (json.has("setupComplete") || json.has("setup_complete")) {
+                         isSetupComplete = true
+@@ -87,19 +142,34 @@
+             }
+         })
+     }
+-    
+-    private fun sendGeminiSetup(targetLang: String) {
++
++    private fun sendGeminiSetup(targetLang: String, mode: StreamMode, enableTranscription: Boolean) {
+         val targetLangCode = targetLang.split("-")[0]
+         val setupPayload = JSONObject().apply {
+             put("setup", JSONObject().apply {
+-                put("model", "models/gemini-3.5-live-translate-preview")
++                put("model", LIVE_TRANSLATE_MODEL)
+                 put("generationConfig", JSONObject().apply {
+-                    put("responseModalities", JSONArray().put("AUDIO"))
++                    if (mode == StreamMode.LITE) {
++                        // Text-only translated output: ~10x less data, subtitles without voice.
++                        put("responseModalities", JSONArray().put("TEXT"))
++                    } else {
++                        put("responseModalities", JSONArray().put("AUDIO"))
++                    }
+                     put("translationConfig", JSONObject().apply {
+                         put("targetLanguageCode", targetLangCode)
+                         put("echoTargetLanguage", true)
+                     })
+                 })
++                if (enableTranscription && mode == StreamMode.DUB) {
++                    // Incremental speech transcripts alongside dubbed audio:
++                    // powers floating subtitles, karaoke highlight and shadowing.
++                    put("inputAudioTranscription", JSONObject())
++                    put("outputAudioTranscription", JSONObject())
++                }
++                // Keep long sessions alive without manual reconnects.
++                put("contextWindowCompression", JSONObject().apply {
++                    put("slidingWindow", JSONObject())
++                })
+                 put("sessionResumption", JSONObject().apply {
+                     put("handle", JSONObject.NULL)
+                 })
+@@ -119,7 +189,7 @@
+         }
+         sendAudioNow(base64Audio)
+     }
+-    
++
+     private fun sendAudioNow(base64Audio: String) {
+         val inputPayload = JSONObject().apply {
+             put("realtimeInput", JSONObject().apply {
+diff -ruN '--exclude=build' '--exclude=.gradle' ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/core/obsidian/ObsidianExporter.kt ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/core/obsidian/ObsidianExporter.kt
+--- ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/core/obsidian/ObsidianExporter.kt	1970-01-01 03:30:00.000000000 +0330
++++ ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/core/obsidian/ObsidianExporter.kt	2026-10-17 22:10:32.729559262 +0330
+@@ -0,0 +1,105 @@
++package com.alad.app.core.obsidian
++
++import android.content.Context
++import android.net.Uri
++import android.provider.DocumentsContract
++import android.util.Log
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++
++/**
++ * Saves shadowing sentence cards as Markdown notes into the user's Obsidian
++ * vault. The vault folder is picked once via the Storage Access Framework
++ * (OpenDocumentTree) and its persisted tree URI is stored in settings.
++ */
++object ObsidianExporter {
++    private const val TAG = "ObsidianExporter"
++    private const val DIR_NAME = "ALAD"
++
++    data class Result(val ok: Boolean, val message: String)
++
++    fun saveSentence(
++        context: Context,
++        treeUriString: String,
++        original: String,
++        translated: String,
++        targetLang: String
++    ): Result {
++        if (treeUriString.isBlank()) {
++            return Result(false, "Connect your Obsidian vault in Settings first")
++        }
++        return try {
++            val treeUri = Uri.parse(treeUriString)
++            val resolver = context.contentResolver
++
++            // Find or create the ALAD directory inside the vault.
++            val dirId = DocumentsContract.getTreeDocumentId(treeUri)
++            var dirUri = findChildDir(resolver, treeUri, dirId, DIR_NAME)
++            if (dirUri == null) {
++                dirUri = DocumentsContract.createDocument(
++                    resolver,
++                    DocumentsContract.buildDocumentUriUsingTree(treeUri, dirId),
++                    DocumentsContract.Document.MIME_TYPE_DIR,
++                    DIR_NAME
++                ) ?: return Result(false, "Could not create folder in vault")
++            }
++
++            val stamp = SimpleDateFormat("yyyy-MM-dd-HHmmss", Locale.US).format(Date())
++            val fileName = "shadowing-$stamp.md"
++            val fileUri = DocumentsContract.createDocument(
++                resolver, dirUri, "text/markdown", fileName
++            ) ?: return Result(false, "Could not create note")
++
++            val body = buildString {
++                append("---\n")
++                append("type: alad-shadowing\n")
++                append("tags:\n")
++                append("  - ").append(targetLang).append('\n')
++                append("  - flashcards\n")
++                append("---\n")
++                append("# Shadowing card\n\n")
++                append("**Original:** ").append(original.trim()).append("\n\n")
++                append("**Translation:** ").append(translated.trim()).append("\n")
++            }
++            resolver.openOutputStream(fileUri, "wt")?.use { out ->
++                out.write(body.toByteArray(Charsets.UTF_8))
++            } ?: return Result(false, "Could not write note")
++
++            Result(true, "Saved to Obsidian")
++        } catch (e: Exception) {
++            Log.w(TAG, "Obsidian export failed", e)
++            Result(false, "Couldn't save: ${e.message}")
++        }
++    }
++
++    private fun findChildDir(
++        resolver: android.content.ContentResolver,
++        treeUri: Uri,
++        parentId: String,
++        name: String
++    ): Uri? {
++        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentId)
++        resolver.query(
++            childrenUri,
++            arrayOf(
++                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
++                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
++                DocumentsContract.Document.COLUMN_MIME_TYPE
++            ),
++            null, null, null
++        )?.use { c ->
++            val idCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
++            val nameCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
++            val mimeCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
++            while (c.moveToNext()) {
++                if (c.getString(nameCol) == name &&
++                    c.getString(mimeCol) == DocumentsContract.Document.MIME_TYPE_DIR
++                ) {
++                    return DocumentsContract.buildDocumentUriUsingTree(treeUri, c.getString(idCol))
++                }
++            }
++        }
++        return null
++    }
++}
+diff -ruN '--exclude=build' '--exclude=.gradle' ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/core/service/AudioDubbingForegroundService.kt ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/core/service/AudioDubbingForegroundService.kt
+--- ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/core/service/AudioDubbingForegroundService.kt	2026-08-28 19:18:21.000000000 +0330
++++ ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/core/service/AudioDubbingForegroundService.kt	2026-10-17 22:10:32.713559262 +0330
+@@ -16,6 +16,9 @@
+ import com.alad.app.core.audio.AudioCaptureManager
+ import com.alad.app.core.audio.AudioPlayerManager
+ import com.alad.app.core.network.ALADWebSocketManager
++import com.alad.app.core.network.StreamMode
++import com.alad.app.core.network.TranscriptKind
++import com.alad.app.core.shadow.ShadowController
+ import com.alad.app.data.repository.UserPreferencesRepository
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+@@ -31,48 +34,72 @@
+     companion object {
+         private const val CHANNEL_ID = "alad_dubbing_channel"
+         private const val NOTIFICATION_ID = 101
+-        
++
+         const val ACTION_START = "ACTION_START"
+         const val ACTION_STOP = "ACTION_STOP"
+         const val EXTRA_RESULT_CODE = "EXTRA_RESULT_CODE"
+         const val EXTRA_RESULT_DATA = "EXTRA_RESULT_DATA"
++        const val EXTRA_AUDIO_SOURCE = "EXTRA_AUDIO_SOURCE"
+         private const val TAG = "DubbingService"
+-        
++
+         val isRunning = MutableStateFlow(false)
+         val audioAmplitude = MutableStateFlow(0f)
++
++        /** RMS below this (normalized 0..1) counts as silence for the quota saver. */
++        private const val SILENCE_RMS = 0.012f
++        /** Stop forwarding audio after this long of continuous silence. */
++        private const val SILENCE_TIMEOUT_MS = 1200L
+     }
+ 
+     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
+-    
++
+     private var mediaProjection: MediaProjection? = null
+     private var audioCaptureManager: AudioCaptureManager? = null
+     private var audioPlayerManager: AudioPlayerManager? = null
+     private var webSocketManager: ALADWebSocketManager? = null
+     private var langObservationJob: Job? = null
++    private var shadowController: ShadowController? = null
++    private val sentenceBuffer get() = LiveSessionState.sentenceBuffer
++
++    // Per-session feature flags (snapshot at start)
++    private var fgsMicMode = false
++    private var liteMode = false
++    private var shadowMode = false
++    private var shadowAutopause = false
++    private var skipSilence = true
++    private var useMic = false
++
++    // Incremental transcript accumulators
++    private val inputAcc = StringBuilder()
++    private val outputAcc = StringBuilder()
++
++    // Karaoke progress estimation (24 kHz mono 16-bit dubbed audio)
++    private var karaokeAudioBytes = 0L
++    private var karaokeWordCount = 0
++
++    // Silence gating state
++    private var silenceSince = 0L
++    private var forwarding = true
+ 
+     override fun onCreate() {
+         super.onCreate()
+         createNotificationChannel()
++        shadowController = ShadowController(this)
+     }
+ 
+     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+         val action = intent?.action
+-        
++
+         when (action) {
+             ACTION_START -> {
+-                val notification = createNotification()
+-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+-                    startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+-                } else {
+-                    startForeground(NOTIFICATION_ID, notification)
+-                }
+-                
++                fgsMicMode = intent.getStringExtra(EXTRA_AUDIO_SOURCE) ==
++                    UserPreferencesRepository.AUDIO_SOURCE_MIC
++                startForegroundWithType(createNotification())
++
+                 val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
+                 val data = intent.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
+-                
+-                if (resultCode != 0 && data != null) {
+-                    startDubbing(resultCode, data)
+-                }
++
++                startDubbing(resultCode, data)
+             }
+             ACTION_STOP -> {
+                 stopDubbing()
+@@ -84,37 +111,61 @@
+         return START_NOT_STICKY
+     }
+ 
+-    private fun startDubbing(resultCode: Int, data: Intent) {
++    private fun startDubbing(resultCode: Int, data: Intent?) {
+         isRunning.value = true
+-        val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+-        mediaProjection = projectionManager.getMediaProjection(resultCode, data)
+-        
++        LiveSessionState.reset()
++        sentenceBuffer.clear()
++        inputAcc.clear()
++        outputAcc.clear()
++
++        if (resultCode != 0 && data != null) {
++            val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
++            mediaProjection = projectionManager.getMediaProjection(resultCode, data)
++        }
++
+         serviceScope.launch {
+             val repository = UserPreferencesRepository(applicationContext)
+-            
++
+             val apiKey = repository.apiKeyFlow.first()
+             val targetLang = repository.targetLangFlow.first()
+             val volumeRatio = repository.volumeRatioFlow.first()
+-            
++            liteMode = repository.liteModeFlow.first()
++            shadowMode = repository.shadowModeFlow.first()
++            shadowAutopause = repository.shadowAutopauseFlow.first()
++            skipSilence = repository.skipSilenceFlow.first()
++            useMic = fgsMicMode
++            val subtitlesOn = repository.subtitlesEnabledFlow.first()
++
++            val mode = if (liteMode) StreamMode.LITE else StreamMode.DUB
+             webSocketManager = ALADWebSocketManager(OkHttpClient())
+-            
+-            audioPlayerManager = AudioPlayerManager(applicationContext)
+-            audioPlayerManager?.start()
+-            audioPlayerManager?.setVolume(volumeRatio)
+-            
++
++            if (!liteMode) {
++                audioPlayerManager = AudioPlayerManager(applicationContext)
++                audioPlayerManager?.start()
++                audioPlayerManager?.setVolume(volumeRatio)
++            }
++
+             webSocketManager?.onStatusChanged = { status ->
+                 android.os.Handler(android.os.Looper.getMainLooper()).post {
+                     android.widget.Toast.makeText(applicationContext, "WS Status: $status", android.widget.Toast.LENGTH_LONG).show()
+                 }
+             }
+-            
++
+             webSocketManager?.onBinaryMessageReceived = { audioChunk ->
+                 audioPlayerManager?.playAudioData(audioChunk)
++                onDubAudioPlayed(audioChunk.size)
+             }
+-            
++
++            webSocketManager?.onTranscriptReceived = { kind, text ->
++                onTranscript(kind, text)
++            }
++            webSocketManager?.onTurnComplete = {
++                finalizeSentence()
++            }
++
+             // sourceLang is no longer used for Bidi Setup
+-            webSocketManager?.connect(apiKey, "", targetLang)
+-            
++            webSocketManager?.connect(apiKey, targetLang, mode, enableTranscription = true)
++
+             langObservationJob?.cancel()
+             langObservationJob = serviceScope.launch {
+                 var firstEmit = true
+@@ -124,63 +175,186 @@
+                     } else {
+                         val currentKey = repository.apiKeyFlow.first()
+                         webSocketManager?.disconnect()
+-                        webSocketManager?.connect(currentKey, "", newLang)
++                        webSocketManager?.connect(currentKey, newLang, mode, enableTranscription = true)
+                     }
+                 }
+             }
+-            
++
+             audioCaptureManager = AudioCaptureManager()
+             val appUid = applicationInfo.uid
+-            
+-            mediaProjection?.let { projection ->
+-                audioCaptureManager?.startCapture(projection, appUid) { pcmData ->
++            val onPcm: (ByteArray) -> Unit = { pcmData ->
++                sentenceBuffer.push(pcmData)
++                if (shouldForward(pcmData)) {
+                     webSocketManager?.sendAudioData(pcmData)
+-                    
+-                    // Calculate RMS amplitude
+-                    var sum = 0.0
+-                    for (i in pcmData.indices step 2) {
+-                        if (i + 1 < pcmData.size) {
+-                            val sample = (pcmData[i].toInt() and 0xFF) or (pcmData[i+1].toInt() shl 8)
+-                            val signedSample = sample.toShort().toFloat()
+-                            sum += signedSample * signedSample
+-                        }
+-                    }
+-                    val rms = if (pcmData.isNotEmpty()) sqrt(sum / (pcmData.size / 2)).toFloat() else 0f
+-                    // Normalize and boost slightly for better visual effect (x3)
+-                    val normalized = (rms / 32767f * 3f).coerceIn(0f, 1f)
+-                    
+-                    // Apply low-pass filter for smooth animation
+-                    val current = audioAmplitude.value
+-                    audioAmplitude.value = current * 0.5f + normalized * 0.5f
++                }
++                updateAmplitude(pcmData)
++            }
++
++            if (useMic) {
++                // Around-me mode: microphone, no screen-capture projection needed.
++                audioCaptureManager?.startMicCapture(onPcm)
++            } else {
++                mediaProjection?.let { projection ->
++                    audioCaptureManager?.startCapture(projection, appUid, onPcm)
++                }
++            }
++
++            if (subtitlesOn) {
++                startService(Intent(applicationContext, SubtitleOverlayService::class.java))
++            }
++
++            // Refresh the foreground notification now that the mode is known.
++            startForegroundWithType(createNotification())
++        }
++    }
++
++    private fun startForegroundWithType(notification: Notification) {
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
++            val type = if (fgsMicMode && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
++                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
++            } else {
++                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
++            }
++            startForeground(NOTIFICATION_ID, notification, type)
++        } else {
++            startForeground(NOTIFICATION_ID, notification)
++        }
++    }
++
++    /** Quota saver: don't send audio while the source is silent/paused. */
++    private fun shouldForward(pcmData: ByteArray): Boolean {
++        if (!skipSilence) return true
++        val rms = rmsNormalized(pcmData)
++        val now = System.currentTimeMillis()
++        return if (rms < SILENCE_RMS) {
++            if (forwarding) {
++                if (silenceSince == 0L) silenceSince = now
++                if (now - silenceSince > SILENCE_TIMEOUT_MS) {
++                    forwarding = false
++                    Log.d(TAG, "Silence gate closed (quota saver)")
++                }
++            }
++            false
++        } else {
++            if (!forwarding) Log.d(TAG, "Silence gate opened")
++            silenceSince = 0L
++            forwarding = true
++            true
++        }
++    }
++
++    private fun updateAmplitude(pcmData: ByteArray) {
++        val normalized = rmsNormalized(pcmData)
++        val current = audioAmplitude.value
++        audioAmplitude.value = current * 0.5f + (normalized * 3f).coerceIn(0f, 1f) * 0.5f
++    }
++
++    private fun rmsNormalized(pcmData: ByteArray): Float {
++        var sum = 0.0
++        var n = 0
++        for (i in pcmData.indices step 2) {
++            if (i + 1 < pcmData.size) {
++                val sample = (pcmData[i].toInt() and 0xFF) or (pcmData[i + 1].toInt() shl 8)
++                val s = sample.toShort().toFloat()
++                sum += s * s
++                n++
++            }
++        }
++        return if (n > 0) (sqrt(sum / n) / 32767f).toFloat() else 0f
++    }
++
++    private fun onTranscript(kind: TranscriptKind, text: String) {
++        if (text.isBlank()) return
++        when (kind) {
++            TranscriptKind.INPUT -> {
++                inputAcc.append(text)
++                LiveSessionState.subtitleOriginal.value = inputAcc.toString()
++            }
++            TranscriptKind.OUTPUT -> {
++                outputAcc.append(text)
++                val full = outputAcc.toString()
++                LiveSessionState.subtitleTranslated.value = full
++                updateKaraoke(full)
++                // Heuristic sentence boundary when the model doesn't send turnComplete.
++                if (isSentenceEnd(full) && full.length > 12) {
++                    finalizeSentence()
+                 }
+             }
+         }
+     }
+ 
++    private fun isSentenceEnd(text: String): Boolean {
++        val t = text.trimEnd()
++        return t.endsWith(".") || t.endsWith("!") || t.endsWith("?") ||
++            t.endsWith("。") || t.endsWith("！") || t.endsWith("؟")
++    }
++
++    /** Estimate which translated words the dubbed voice has already spoken. */
++    private fun onDubAudioPlayed(bytes: Int) {
++        if (karaokeWordCount == 0) return
++        karaokeAudioBytes += bytes
++        // 24 kHz mono 16-bit -> 48000 bytes/sec; assume ~2.6 words/sec average speech.
++        val spokenSec = karaokeAudioBytes / 48000.0
++        val spoken = (spokenSec * 2.6).toInt().coerceIn(0, karaokeWordCount)
++        LiveSessionState.karaokeSpoken.value = spoken
++    }
++
++    private fun updateKaraoke(translated: String) {
++        val words = translated.trim().split("\\s+".toRegex()).filter { it.isNotEmpty() }
++        if (words.size != karaokeWordCount) {
++            karaokeWordCount = words.size
++            karaokeAudioBytes = 0L
++            LiveSessionState.karaokeWords.value = words
++            LiveSessionState.karaokeSpoken.value = 0
++        } else {
++            LiveSessionState.karaokeWords.value = words
++        }
++    }
++
++    private fun finalizeSentence() {
++        val original = inputAcc.toString().trim()
++        val translated = outputAcc.toString().trim()
++        inputAcc.clear()
++        outputAcc.clear()
++        karaokeWordCount = 0
++        karaokeAudioBytes = 0L
++        if (translated.isEmpty()) return
++
++        if (shadowMode) {
++            LiveSessionState.shadowCard.value = ShadowCard(original, translated)
++            if (shadowAutopause) {
++                shadowController?.pauseMedia()
++                LiveSessionState.shadowPaused.value = true
++            }
++        }
++    }
++
+     private fun stopDubbing() {
+         isRunning.value = false
++        LiveSessionState.reset()
+         audioCaptureManager?.stopCapture()
+         audioCaptureManager = null
+-        
++
+         audioPlayerManager?.stop()
+         audioPlayerManager = null
+-        
++
+         webSocketManager?.disconnect()
+         webSocketManager = null
+-        
++
+         audioAmplitude.value = 0f
+-        
++        sentenceBuffer.clear()
++
+         langObservationJob?.cancel()
+         langObservationJob = null
+-        
++
+         mediaProjection?.stop()
+         mediaProjection = null
+-    }
+ 
+-    override fun onBind(intent: Intent?): IBinder? {
+-        return null
++        stopService(Intent(this, SubtitleOverlayService::class.java))
+     }
+ 
++    override fun onBind(intent: Intent?): IBinder? = null
++
+     override fun onDestroy() {
+         super.onDestroy()
+         if (isRunning.value) {
+@@ -217,8 +391,9 @@
+             this, 1, stopIntent, android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT
+         )
+ 
++        val title = if (liteMode) "ALAD Lite Subtitles" else "ALAD Live Dubbing"
+         return NotificationCompat.Builder(this, CHANNEL_ID)
+-            .setContentTitle("ALAD Live Dubbing")
++            .setContentTitle(title)
+             .setContentText("Connected and dubbing...")
+             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+             .setPriority(NotificationCompat.PRIORITY_LOW)
+diff -ruN '--exclude=build' '--exclude=.gradle' ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/core/service/DubTileService.kt ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/core/service/DubTileService.kt
+--- ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/core/service/DubTileService.kt	1970-01-01 03:30:00.000000000 +0330
++++ ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/core/service/DubTileService.kt	2026-10-17 22:10:32.726559262 +0330
+@@ -0,0 +1,85 @@
++package com.alad.app.core.service
++
++import android.content.Intent
++import android.os.Build
++import android.service.quicksettings.Tile
++import android.service.quicksettings.TileService
++import androidx.annotation.RequiresApi
++import com.alad.app.TransparentCaptureActivity
++import com.alad.app.data.repository.UserPreferencesRepository
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.launch
++
++/**
++ * Quick Settings tile: toggle live dubbing without leaving the current app.
++ * Turning on routes through [TransparentCaptureActivity] (or straight to the
++ * service in mic/around-me mode); turning off stops the dubbing service.
++ */
++@RequiresApi(Build.VERSION_CODES.N)
++class DubTileService : TileService() {
++
++    private val scope = CoroutineScope(Dispatchers.Main + Job())
++
++    override fun onStartListening() {
++        super.onStartListening()
++        updateTile()
++    }
++
++    override fun onClick() {
++        super.onClick()
++        if (AudioDubbingForegroundService.isRunning.value) {
++            val intent = Intent(this, AudioDubbingForegroundService::class.java).apply {
++                action = AudioDubbingForegroundService.ACTION_STOP
++            }
++            startService(intent)
++        } else {
++            scope.launch {
++                val repository = UserPreferencesRepository(applicationContext)
++                val useMic = repository.audioSourceFlow.first() ==
++                    UserPreferencesRepository.AUDIO_SOURCE_MIC
++                if (useMic) {
++                    // No screen-capture permission needed for microphone mode.
++                    val intent = Intent(applicationContext, AudioDubbingForegroundService::class.java).apply {
++                        action = AudioDubbingForegroundService.ACTION_START
++                        putExtra(
++                            AudioDubbingForegroundService.EXTRA_AUDIO_SOURCE,
++                            UserPreferencesRepository.AUDIO_SOURCE_MIC
++                        )
++                    }
++                    startForegroundServiceCompat(intent)
++                } else {
++                    val intent = Intent(applicationContext, TransparentCaptureActivity::class.java).apply {
++                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++                    }
++                    // TileService is not an Activity context; collapse shade first.
++                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
++                        startActivityAndCollapse(intent)
++                    } else {
++                        @Suppress("DEPRECATION")
++                        startActivityAndCollapse(intent)
++                    }
++                }
++            }
++        }
++        updateTile()
++    }
++
++    private fun updateTile() {
++        qsTile?.let { tile ->
++            val running = AudioDubbingForegroundService.isRunning.value
++            tile.state = if (running) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
++            tile.updateTile()
++        }
++    }
++
++    private fun startForegroundServiceCompat(intent: Intent) {
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++            applicationContext.startForegroundService(intent)
++        } else {
++            applicationContext.startService(intent)
++        }
++    }
++}
+diff -ruN '--exclude=build' '--exclude=.gradle' ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/core/service/LiveSessionState.kt ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/core/service/LiveSessionState.kt
+--- ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/core/service/LiveSessionState.kt	1970-01-01 03:30:00.000000000 +0330
++++ ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/core/service/LiveSessionState.kt	2026-10-17 22:10:32.724116007 +0330
+@@ -0,0 +1,49 @@
++package com.alad.app.core.service
++
++import com.alad.app.core.shadow.SentenceBuffer
++import kotlinx.coroutines.flow.MutableStateFlow
++
++/** One finalized sentence pair for the shadowing overlay card. */
++data class ShadowCard(
++    val original: String,
++    val translated: String,
++    /** seconds of input audio kept for replay */
++    val replaySeconds: Int = 20
++)
++
++/**
++ * Process-wide live state shared between the dubbing foreground service and
++ * the subtitle overlay service. All flows are updated on the service's IO
++ * scope; collectors must be prepared for updates from any thread.
++ */
++object LiveSessionState {
++    /** Latest incremental input-language transcript (what was said). */
++    val subtitleOriginal = MutableStateFlow("")
++
++    /** Latest incremental translated transcript (what it means). */
++    val subtitleTranslated = MutableStateFlow("")
++
++    /** Current shadowing card, or null when shadowing is off / no sentence yet. */
++    val shadowCard = MutableStateFlow<ShadowCard?>(null)
++
++    /** Words of the current translated sentence for karaoke highlight. */
++    val karaokeWords = MutableStateFlow<List<String>>(emptyList())
++
++    /** How many of [karaokeWords] have been "spoken" by the dubbed voice. */
++    val karaokeSpoken = MutableStateFlow(0)
++
++    /** True while the shadowing card is waiting for the learner to repeat. */
++    val shadowPaused = MutableStateFlow(false)
++
++    /** Recent input audio for sentence replay in the shadowing card. */
++    val sentenceBuffer = SentenceBuffer()
++
++    fun reset() {
++        subtitleOriginal.value = ""
++        subtitleTranslated.value = ""
++        shadowCard.value = null
++        karaokeWords.value = emptyList()
++        karaokeSpoken.value = 0
++        shadowPaused.value = false
++    }
++}
+diff -ruN '--exclude=build' '--exclude=.gradle' ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/core/service/SubtitleOverlayService.kt ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/core/service/SubtitleOverlayService.kt
+--- ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/core/service/SubtitleOverlayService.kt	1970-01-01 03:30:00.000000000 +0330
++++ ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/core/service/SubtitleOverlayService.kt	2026-10-17 22:10:32.725559262 +0330
+@@ -0,0 +1,311 @@
++package com.alad.app.core.service
++
++import android.content.Context
++import android.content.Intent
++import android.graphics.PixelFormat
++import android.os.Build
++import android.view.Gravity
++import android.view.WindowManager
++import android.widget.Toast
++import androidx.compose.foundation.background
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.gestures.detectDragGestures
++import androidx.compose.foundation.layout.*
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.PlayArrow
++import androidx.compose.material.icons.filled.Refresh
++import androidx.compose.material.icons.filled.SlowMotionVideo
++import androidx.compose.material.icons.filled.Star
++import androidx.compose.material3.Icon
++import androidx.compose.material3.IconButton
++import androidx.compose.material3.Text
++import androidx.compose.runtime.*
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.input.pointer.pointerInput
++import androidx.compose.ui.platform.ComposeView
++import androidx.compose.ui.platform.ViewCompositionStrategy
++import androidx.compose.ui.text.SpanStyle
++import androidx.compose.ui.text.buildAnnotatedString
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextAlign
++import androidx.compose.ui.text.withStyle
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import androidx.lifecycle.LifecycleService
++import androidx.lifecycle.lifecycleScope
++import androidx.lifecycle.setViewTreeLifecycleOwner
++import androidx.lifecycle.setViewTreeViewModelStoreOwner
++import androidx.savedstate.setViewTreeSavedStateRegistryOwner
++import com.alad.app.core.obsidian.ObsidianExporter
++import com.alad.app.core.shadow.SentenceReplayPlayer
++import com.alad.app.core.shadow.ShadowController
++import com.alad.app.data.repository.UserPreferencesRepository
++import com.alad.app.ui.theme.*
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.launch
++
++/**
++ * Floating subtitle bar shown over any app while dubbing.
++ * Shows the live translated transcript (and optionally the original),
++ * a karaoke word-by-word highlight, and the shadowing practice card.
++ */
++class SubtitleOverlayService : LifecycleService() {
++
++    private lateinit var windowManager: WindowManager
++    private lateinit var composeView: ComposeView
++    private var params: WindowManager.LayoutParams? = null
++
++    private val savedStateRegistryOwner by lazy { ServiceSavedStateRegistryOwner(this) }
++    private val viewModelStoreOwner by lazy { ServiceViewModelStoreOwner() }
++
++    override fun onCreate() {
++        super.onCreate()
++        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
++
++        val layoutFlag = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
++        } else {
++            @Suppress("DEPRECATION")
++            WindowManager.LayoutParams.TYPE_PHONE
++        }
++
++        params = WindowManager.LayoutParams(
++            WindowManager.LayoutParams.MATCH_PARENT,
++            WindowManager.LayoutParams.WRAP_CONTENT,
++            layoutFlag,
++            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
++            PixelFormat.TRANSLUCENT
++        ).apply {
++            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
++            y = 140
++        }
++
++        val repository = UserPreferencesRepository(applicationContext)
++        val shadowController = ShadowController(applicationContext)
++        val replayPlayer = SentenceReplayPlayer()
++
++        composeView = ComposeView(this).apply {
++            setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
++            setContent {
++                ALADTheme {
++                    SubtitleOverlayContent(
++                        repository = repository,
++                        onDrag = { dx, dy ->
++                            params?.x = (params?.x ?: 0) + dx.toInt()
++                            params?.y = (params?.y ?: 0) - dy.toInt()
++                            windowManager.updateViewLayout(composeView, params)
++                        },
++                        onReplay = { slow ->
++                            val card = LiveSessionState.shadowCard.value
++                            val pcm = LiveSessionState.sentenceBuffer.snapshot(card?.replaySeconds ?: 20)
++                            if (pcm != null) replayPlayer.play(pcm, slow)
++                        },
++                        onSaveToObsidian = {
++                            val card = LiveSessionState.shadowCard.value
++                            if (card != null) {
++                                lifecycleScope.launch {
++                                    val uri = repository.obsidianUriFlow.first()
++                                    val lang = repository.targetLangFlow.first()
++                                    val res = ObsidianExporter.saveSentence(
++                                        applicationContext, uri, card.original, card.translated, lang
++                                    )
++                                    Toast.makeText(applicationContext, res.message, Toast.LENGTH_SHORT).show()
++                                }
++                            }
++                        },
++                        onResume = {
++                            replayPlayer.stop()
++                            LiveSessionState.shadowCard.value = null
++                            LiveSessionState.shadowPaused.value = false
++                            shadowController.resumeMedia()
++                        }
++                    )
++                }
++            }
++        }
++
++        composeView.setViewTreeLifecycleOwner(this)
++        composeView.setViewTreeSavedStateRegistryOwner(savedStateRegistryOwner)
++        composeView.setViewTreeViewModelStoreOwner(viewModelStoreOwner)
++
++        windowManager.addView(composeView, params)
++    }
++
++    override fun onDestroy() {
++        super.onDestroy()
++        if (::composeView.isInitialized) {
++            windowManager.removeView(composeView)
++        }
++    }
++}
++
++@Composable
++private fun SubtitleOverlayContent(
++    repository: UserPreferencesRepository,
++    onDrag: (Float, Float) -> Unit,
++    onReplay: (Boolean) -> Unit,
++    onSaveToObsidian: () -> Unit,
++    onResume: () -> Unit
++) {
++    val translated by LiveSessionState.subtitleTranslated.collectAsState()
++    val original by LiveSessionState.subtitleOriginal.collectAsState()
++    val shadowCard by LiveSessionState.shadowCard.collectAsState()
++    val karaokeWords by LiveSessionState.karaokeWords.collectAsState()
++    val karaokeSpoken by LiveSessionState.karaokeSpoken.collectAsState()
++    val scope = rememberCoroutineScope()
++
++    var showOriginal by remember { mutableStateOf(false) }
++    var karaokeOn by remember { mutableStateOf(false) }
++    var textScale by remember { mutableStateOf(1.0f) }
++
++    LaunchedEffect(Unit) {
++        launch { repository.showOriginalFlow.collect { showOriginal = it } }
++        launch { repository.karaokeFlow.collect { karaokeOn = it } }
++        launch { repository.subtitleSizeFlow.collect { textScale = it } }
++    }
++
++    // Hide entirely when there is nothing to show and no shadow card.
++    if (translated.isBlank() && original.isBlank() && shadowCard == null) {
++        Box(modifier = Modifier.size(1.dp))
++        return
++    }
++
++    Column(
++        modifier = Modifier
++            .fillMaxWidth()
++            .padding(horizontal = 24.dp)
++            .pointerInput(Unit) {
++                detectDragGestures { change, dragAmount ->
++                    change.consume()
++                    onDrag(dragAmount.x, dragAmount.y)
++                }
++            },
++        horizontalAlignment = Alignment.CenterHorizontally
++    ) {
++        if (shadowCard != null) {
++            ShadowCardView(
++                card = shadowCard!!,
++                textScale = textScale,
++                onReplay = onReplay,
++                onSave = onSaveToObsidian,
++                onResume = onResume
++            )
++            Spacer(modifier = Modifier.height(8.dp))
++        }
++
++        if (translated.isNotBlank() || original.isNotBlank()) {
++            Box(
++                modifier = Modifier
++                    .clip(RoundedCornerShape(14.dp))
++                    .background(Color.Black.copy(alpha = 0.72f))
++                    .padding(horizontal = 16.dp, vertical = 10.dp)
++            ) {
++                Column(horizontalAlignment = Alignment.CenterHorizontally) {
++                    if (showOriginal && original.isNotBlank()) {
++                        Text(
++                            text = original,
++                            color = Color.White.copy(alpha = 0.65f),
++                            fontSize = (13 * textScale).sp,
++                            textAlign = TextAlign.Center
++                        )
++                        Spacer(modifier = Modifier.height(4.dp))
++                    }
++                    if (karaokeOn && karaokeWords.isNotEmpty()) {
++                        Text(
++                            text = buildAnnotatedString {
++                                karaokeWords.forEachIndexed { i, w ->
++                                    if (i < karaokeSpoken) {
++                                        withStyle(SpanStyle(color = NeonCyan, fontWeight = FontWeight.Bold)) {
++                                            append(w)
++                                        }
++                                    } else {
++                                        withStyle(SpanStyle(color = Color.White)) { append(w) }
++                                    }
++                                    append(" ")
++                                }
++                            },
++                            fontSize = (17 * textScale).sp,
++                            fontWeight = FontWeight.Medium,
++                            textAlign = TextAlign.Center,
++                            lineHeight = (24 * textScale).sp
++                        )
++                    } else if (translated.isNotBlank()) {
++                        Text(
++                            text = translated,
++                            color = Color.White,
++                            fontSize = (17 * textScale).sp,
++                            fontWeight = FontWeight.Medium,
++                            textAlign = TextAlign.Center,
++                            lineHeight = (24 * textScale).sp
++                        )
++                    }
++                }
++            }
++        }
++        Spacer(modifier = Modifier.height(8.dp))
++    }
++}
++
++@Composable
++private fun ShadowCardView(
++    card: ShadowCard,
++    textScale: Float,
++    onReplay: (Boolean) -> Unit,
++    onSave: () -> Unit,
++    onResume: () -> Unit
++) {
++    Column(
++        modifier = Modifier
++            .clip(RoundedCornerShape(18.dp))
++            .background(Color(0xFF101A30).copy(alpha = 0.94f))
++            .padding(16.dp),
++        horizontalAlignment = Alignment.CenterHorizontally
++    ) {
++        Text(
++            text = "Shadowing · listen and repeat",
++            color = NeonCyan,
++            fontSize = (12 * textScale).sp,
++            fontWeight = FontWeight.Bold
++        )
++        Spacer(modifier = Modifier.height(8.dp))
++        Text(
++            text = card.original.ifBlank { card.translated },
++            color = Color.White,
++            fontSize = (20 * textScale).sp,
++            fontWeight = FontWeight.Bold,
++            textAlign = TextAlign.Center,
++            lineHeight = (28 * textScale).sp
++        )
++        if (card.original.isNotBlank()) {
++            Spacer(modifier = Modifier.height(6.dp))
++            Text(
++                text = card.translated,
++                color = Color.White.copy(alpha = 0.75f),
++                fontSize = (15 * textScale).sp,
++                textAlign = TextAlign.Center
++            )
++        }
++        Spacer(modifier = Modifier.height(12.dp))
++        Row(
++            horizontalArrangement = Arrangement.spacedBy(8.dp),
++            verticalAlignment = Alignment.CenterVertically
++        ) {
++            IconButton(onClick = { onReplay(false) }) {
++                Icon(Icons.Default.Refresh, contentDescription = "Replay", tint = Color.White)
++            }
++            IconButton(onClick = { onReplay(true) }) {
++                Icon(Icons.Default.SlowMotionVideo, contentDescription = "Replay slow", tint = NeonCyan)
++            }
++            IconButton(onClick = onSave) {
++                Icon(Icons.Default.Star, contentDescription = "Save to Obsidian", tint = NeonCoral)
++            }
++            IconButton(onClick = onResume) {
++                Icon(Icons.Default.PlayArrow, contentDescription = "Resume video", tint = NeonCyan)
++            }
++        }
++    }
++}
+diff -ruN '--exclude=build' '--exclude=.gradle' ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/core/shadow/SentenceBuffer.kt ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/core/shadow/SentenceBuffer.kt
+--- ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/core/shadow/SentenceBuffer.kt	1970-01-01 03:30:00.000000000 +0330
++++ ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/core/shadow/SentenceBuffer.kt	2026-10-17 22:10:32.728509517 +0330
+@@ -0,0 +1,99 @@
++package com.alad.app.core.shadow
++
++import android.media.AudioAttributes
++import android.media.AudioFormat
++import android.media.AudioTrack
++import android.media.PlaybackParams
++import android.os.Build
++import android.util.Log
++import java.util.ArrayDeque
++
++/**
++ * Ring buffer of recently captured input audio (16 kHz mono PCM-16) so the
++ * shadowing overlay can replay the last sentence at normal or slow speed.
++ */
++class SentenceBuffer(
++    private val sampleRate: Int = 16000,
++    private val maxSeconds: Int = 45
++) {
++    private val maxBytes = sampleRate * 2 * maxSeconds
++    private val chunks = ArrayDeque<ByteArray>()
++    private var bufferedBytes = 0
++
++    @Synchronized
++    fun push(pcm: ByteArray) {
++        chunks.addLast(pcm)
++        bufferedBytes += pcm.size
++        while (bufferedBytes > maxBytes && chunks.isNotEmpty()) {
++            bufferedBytes -= chunks.removeFirst().size
++        }
++    }
++
++    /** Last [seconds] of audio as one PCM blob, or null when empty. */
++    @Synchronized
++    fun snapshot(seconds: Int): ByteArray? {
++        if (chunks.isEmpty()) return null
++        val want = (sampleRate * 2 * seconds).coerceAtMost(bufferedBytes)
++        val out = ByteArray(want)
++        var pos = want
++        val it = chunks.descendingIterator()
++        while (it.hasNext() && pos > 0) {
++            val c = it.next()
++            val take = minOf(c.size, pos)
++            System.arraycopy(c, c.size - take, out, pos - take, take)
++            pos -= take
++        }
++        return out
++    }
++
++    @Synchronized
++    fun clear() {
++        chunks.clear()
++        bufferedBytes = 0
++    }
++}
++
++/** One-shot player for sentence replay (normal / 0.5x slow). */
++class SentenceReplayPlayer {
++    companion object {
++        private const val TAG = "SentenceReplayPlayer"
++    }
++
++    private var track: AudioTrack? = null
++
++    fun play(pcm16kMono: ByteArray, slow: Boolean) {
++        stop()
++        try {
++            val track = AudioTrack(
++                AudioAttributes.Builder()
++                    .setUsage(AudioAttributes.USAGE_MEDIA)
++                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
++                    .build(),
++                AudioFormat.Builder()
++                    .setSampleRate(16000)
++                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
++                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
++                    .build(),
++                pcm16kMono.size.coerceAtLeast(4096),
++                AudioTrack.MODE_STATIC,
++                android.media.AudioManager.AUDIO_SESSION_ID_GENERATE
++            )
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && slow) {
++                track.playbackParams = PlaybackParams().setSpeed(0.5f)
++            }
++            track.write(pcm16kMono, 0, pcm16kMono.size)
++            track.play()
++            this.track = track
++        } catch (e: Exception) {
++            Log.w(TAG, "replay failed", e)
++        }
++    }
++
++    fun stop() {
++        try {
++            track?.stop()
++            track?.release()
++        } catch (_: Exception) { }
++        track = null
++    }
++}
+diff -ruN '--exclude=build' '--exclude=.gradle' ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/core/shadow/ShadowController.kt ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/core/shadow/ShadowController.kt
+--- ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/core/shadow/ShadowController.kt	1970-01-01 03:30:00.000000000 +0330
++++ ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/core/shadow/ShadowController.kt	2026-10-17 22:10:32.727471210 +0330
+@@ -0,0 +1,35 @@
++package com.alad.app.core.shadow
++
++import android.content.Context
++import android.media.AudioManager
++import android.os.SystemClock
++import android.util.Log
++import android.view.KeyEvent
++
++/**
++ * Pauses / resumes the currently playing media app by dispatching media-key
++ * events, the same mechanism headset buttons use. Used by shadowing mode's
++ * auto-pause: after each translated sentence the video pauses so the learner
++ * can repeat the sentence out loud.
++ */
++class ShadowController(context: Context) {
++    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
++
++    companion object {
++        private const val TAG = "ShadowController"
++    }
++
++    private fun dispatch(keyCode: Int) {
++        try {
++            val now = SystemClock.uptimeMillis()
++            audioManager.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0))
++            audioManager.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, keyCode, 0))
++        } catch (e: Exception) {
++            Log.w(TAG, "dispatchMediaKeyEvent failed", e)
++        }
++    }
++
++    fun pauseMedia() = dispatch(KeyEvent.KEYCODE_MEDIA_PAUSE)
++    fun resumeMedia() = dispatch(KeyEvent.KEYCODE_MEDIA_PLAY)
++    fun toggleMedia() = dispatch(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
++}
+diff -ruN '--exclude=build' '--exclude=.gradle' ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/data/repository/UserPreferencesRepository.kt ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/data/repository/UserPreferencesRepository.kt
+--- ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/data/repository/UserPreferencesRepository.kt	2026-08-28 19:18:21.000000000 +0330
++++ ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/data/repository/UserPreferencesRepository.kt	2026-10-17 22:10:32.731559262 +0330
+@@ -17,6 +17,21 @@
+         val SOURCE_LANG = stringPreferencesKey("source_lang")
+         val TARGET_LANG = stringPreferencesKey("target_lang")
+         val VOLUME_RATIO = floatPreferencesKey("volume_ratio")
++
++        // --- Pazhvak-parity features ---
++        val SUBTITLES_ENABLED = booleanPreferencesKey("subtitles_enabled")
++        val SHOW_ORIGINAL = booleanPreferencesKey("show_original")
++        val KARAOKE = booleanPreferencesKey("karaoke")
++        val LITE_MODE = booleanPreferencesKey("lite_mode")
++        val SHADOW_MODE = booleanPreferencesKey("shadow_mode")
++        val SHADOW_AUTOPAUSE = booleanPreferencesKey("shadow_autopause")
++        val AUDIO_SOURCE = stringPreferencesKey("audio_source") // "internal" | "mic"
++        val SKIP_SILENCE = booleanPreferencesKey("skip_silence")
++        val OBSIDIAN_URI = stringPreferencesKey("obsidian_uri")
++        val SUBTITLE_SIZE = floatPreferencesKey("subtitle_size")
++
++        const val AUDIO_SOURCE_INTERNAL = "internal"
++        const val AUDIO_SOURCE_MIC = "mic"
+     }
+ 
+     val wsUrlFlow: Flow<String> = context.dataStore.data.map { it[WS_URL] ?: "ws://192.168.1.100:8000/ws/dub" }
+@@ -25,9 +40,31 @@
+     val targetLangFlow: Flow<String> = context.dataStore.data.map { it[TARGET_LANG] ?: "fa" }
+     val volumeRatioFlow: Flow<Float> = context.dataStore.data.map { it[VOLUME_RATIO] ?: 1.0f }
+ 
++    val subtitlesEnabledFlow: Flow<Boolean> = context.dataStore.data.map { it[SUBTITLES_ENABLED] ?: true }
++    val showOriginalFlow: Flow<Boolean> = context.dataStore.data.map { it[SHOW_ORIGINAL] ?: false }
++    val karaokeFlow: Flow<Boolean> = context.dataStore.data.map { it[KARAOKE] ?: false }
++    val liteModeFlow: Flow<Boolean> = context.dataStore.data.map { it[LITE_MODE] ?: false }
++    val shadowModeFlow: Flow<Boolean> = context.dataStore.data.map { it[SHADOW_MODE] ?: false }
++    val shadowAutopauseFlow: Flow<Boolean> = context.dataStore.data.map { it[SHADOW_AUTOPAUSE] ?: true }
++    val audioSourceFlow: Flow<String> = context.dataStore.data.map { it[AUDIO_SOURCE] ?: AUDIO_SOURCE_INTERNAL }
++    val skipSilenceFlow: Flow<Boolean> = context.dataStore.data.map { it[SKIP_SILENCE] ?: true }
++    val obsidianUriFlow: Flow<String> = context.dataStore.data.map { it[OBSIDIAN_URI] ?: "" }
++    val subtitleSizeFlow: Flow<Float> = context.dataStore.data.map { it[SUBTITLE_SIZE] ?: 1.0f }
++
+     suspend fun updateWsUrl(url: String) { context.dataStore.edit { it[WS_URL] = url } }
+     suspend fun updateApiKey(key: String) { context.dataStore.edit { it[API_KEY] = key } }
+     suspend fun updateSourceLang(lang: String) { context.dataStore.edit { it[SOURCE_LANG] = lang } }
+     suspend fun updateTargetLang(lang: String) { context.dataStore.edit { it[TARGET_LANG] = lang } }
+     suspend fun updateVolumeRatio(ratio: Float) { context.dataStore.edit { it[VOLUME_RATIO] = ratio } }
++
++    suspend fun updateSubtitlesEnabled(v: Boolean) { context.dataStore.edit { it[SUBTITLES_ENABLED] = v } }
++    suspend fun updateShowOriginal(v: Boolean) { context.dataStore.edit { it[SHOW_ORIGINAL] = v } }
++    suspend fun updateKaraoke(v: Boolean) { context.dataStore.edit { it[KARAOKE] = v } }
++    suspend fun updateLiteMode(v: Boolean) { context.dataStore.edit { it[LITE_MODE] = v } }
++    suspend fun updateShadowMode(v: Boolean) { context.dataStore.edit { it[SHADOW_MODE] = v } }
++    suspend fun updateShadowAutopause(v: Boolean) { context.dataStore.edit { it[SHADOW_AUTOPAUSE] = v } }
++    suspend fun updateAudioSource(v: String) { context.dataStore.edit { it[AUDIO_SOURCE] = v } }
++    suspend fun updateSkipSilence(v: Boolean) { context.dataStore.edit { it[SKIP_SILENCE] = v } }
++    suspend fun updateObsidianUri(v: String) { context.dataStore.edit { it[OBSIDIAN_URI] = v } }
++    suspend fun updateSubtitleSize(v: Float) { context.dataStore.edit { it[SUBTITLE_SIZE] = v } }
+ }
+diff -ruN '--exclude=build' '--exclude=.gradle' ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/presentation/main/MainScreen.kt ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/presentation/main/MainScreen.kt
+--- ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/presentation/main/MainScreen.kt	2026-08-28 19:18:21.000000000 +0330
++++ ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/presentation/main/MainScreen.kt	2026-10-17 22:10:32.738559262 +0330
+@@ -235,6 +235,39 @@
+                     modifier = Modifier.fillMaxWidth()
+                 )
+ 
++                // Active mode badges (Lite / Shadow / Around-me)
++                val liteMode by viewModel.liteMode.collectAsState()
++                val shadowMode by viewModel.shadowMode.collectAsState()
++                val audioSource by viewModel.audioSource.collectAsState()
++                val badges = buildList {
++                    if (liteMode) add(stringResource(R.string.badge_lite) to NeonCyan)
++                    if (shadowMode) add(stringResource(R.string.badge_shadow) to NeonPurple)
++                    if (audioSource == com.alad.app.data.repository.UserPreferencesRepository.AUDIO_SOURCE_MIC) {
++                        add(stringResource(R.string.badge_mic) to NeonCoral)
++                    }
++                }
++                if (badges.isNotEmpty()) {
++                    Row(
++                        modifier = Modifier
++                            .fillMaxWidth()
++                            .padding(top = 8.dp),
++                        horizontalArrangement = Arrangement.Center
++                    ) {
++                        badges.forEachIndexed { i, (label, color) ->
++                            if (i > 0) Spacer(modifier = Modifier.width(8.dp))
++                            Box(
++                                modifier = Modifier
++                                    .clip(RoundedCornerShape(10.dp))
++                                    .background(color.copy(alpha = 0.15f))
++                                    .border(1.dp, color.copy(alpha = 0.5f), RoundedCornerShape(10.dp))
++                                    .padding(horizontal = 10.dp, vertical = 4.dp)
++                            ) {
++                                Text(label, color = color, fontSize = 11.sp, fontWeight = FontWeight.Bold)
++                            }
++                        }
++                    }
++                }
++
+                 // Neon Audio Waveform Visualizer
+                 AnimatedWaveform(
+                     isConnected = isConnected,
+diff -ruN '--exclude=build' '--exclude=.gradle' ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/presentation/main/MainViewModel.kt ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/presentation/main/MainViewModel.kt
+--- ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/presentation/main/MainViewModel.kt	2026-08-28 19:18:21.000000000 +0330
++++ ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/presentation/main/MainViewModel.kt	2026-10-17 22:10:32.739265060 +0330
+@@ -25,6 +25,14 @@
+     val targetLang: StateFlow<String> = repository.targetLangFlow
+         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), "fa")
+ 
++    val liteMode: StateFlow<Boolean> = repository.liteModeFlow
++        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
++    val shadowMode: StateFlow<Boolean> = repository.shadowModeFlow
++        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
++    val audioSource: StateFlow<String> = repository.audioSourceFlow
++        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000),
++            UserPreferencesRepository.AUDIO_SOURCE_INTERNAL)
++
+     fun updateSourceLang(lang: String) {
+         viewModelScope.launch { repository.updateSourceLang(lang) }
+     }
+diff -ruN '--exclude=build' '--exclude=.gradle' ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/presentation/settings/SettingsScreen.kt ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/presentation/settings/SettingsScreen.kt
+--- ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/presentation/settings/SettingsScreen.kt	2026-08-28 19:18:21.000000000 +0330
++++ ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/presentation/settings/SettingsScreen.kt	2026-10-17 22:10:32.740559262 +0330
+@@ -1,5 +1,8 @@
+ package com.alad.app.presentation.settings
+ 
++import android.content.Intent
++import androidx.activity.compose.rememberLauncherForActivityResult
++import androidx.activity.result.contract.ActivityResultContracts
+ import androidx.compose.foundation.BorderStroke
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.border
+@@ -7,12 +10,18 @@
+ import androidx.compose.foundation.interaction.MutableInteractionSource
+ import androidx.compose.foundation.interaction.collectIsPressedAsState
+ import androidx.compose.foundation.layout.*
++import androidx.compose.foundation.rememberScrollState
+ import androidx.compose.foundation.shape.CircleShape
+ import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.verticalScroll
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.automirrored.filled.ArrowBack
+ import androidx.compose.material.icons.automirrored.filled.OpenInNew
++import androidx.compose.material.icons.filled.ClosedCaption
++import androidx.compose.material.icons.filled.FolderOpen
+ import androidx.compose.material.icons.filled.Key
++import androidx.compose.material.icons.filled.Mic
++import androidx.compose.material.icons.filled.RecordVoiceOver
+ import androidx.compose.material.icons.filled.Save
+ import androidx.compose.material.icons.filled.Visibility
+ import androidx.compose.material.icons.filled.VisibilityOff
+@@ -82,6 +91,7 @@
+                 modifier = Modifier
+                     .fillMaxSize()
+                     .padding(paddingValues)
++                    .verticalScroll(rememberScrollState())
+                     .padding(horizontal = 20.dp, vertical = 12.dp),
+                 verticalArrangement = Arrangement.spacedBy(20.dp)
+             ) {
+@@ -222,7 +232,16 @@
+                     }
+                 }
+ 
+-                Spacer(modifier = Modifier.weight(1f))
++                // ---- Translation options (Pazhvak parity) ----
++                TranslationOptionsCard(viewModel)
++
++                // ---- Audio source options ----
++                AudioOptionsCard(viewModel)
++
++                // ---- Shadowing (language practice) ----
++                ShadowingOptionsCard(viewModel)
++
++                Spacer(modifier = Modifier.height(4.dp))
+ 
+                 // Save Settings Button
+                 val interactionSource = remember { MutableInteractionSource() }
+@@ -281,5 +300,270 @@
+                 }
+             }
+         }
++    }
++}
++
++@Composable
++private fun SectionHeader(icon: androidx.compose.ui.graphics.vector.ImageVector, title: String) {
++    Row(verticalAlignment = Alignment.CenterVertically) {
++        Box(
++            modifier = Modifier
++                .size(36.dp)
++                .clip(CircleShape)
++                .background(NeonPurple.copy(alpha = 0.15f)),
++            contentAlignment = Alignment.Center
++        ) {
++            Icon(icon, contentDescription = null, tint = NeonPurple, modifier = Modifier.size(18.dp))
++        }
++        Spacer(modifier = Modifier.width(10.dp))
++        Text(title, fontWeight = FontWeight.Bold, color = Color.White, fontSize = 15.sp)
++    }
++}
++
++@Composable
++private fun ToggleRow(
++    title: String,
++    desc: String,
++    checked: Boolean,
++    onChecked: (Boolean) -> Unit
++) {
++    Row(
++        modifier = Modifier
++            .fillMaxWidth()
++            .padding(vertical = 8.dp),
++        verticalAlignment = Alignment.CenterVertically,
++        horizontalArrangement = Arrangement.SpaceBetween
++    ) {
++        Column(modifier = Modifier.weight(1f)) {
++            Text(title, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Medium)
++            Text(desc, color = TextSecondary, fontSize = 12.sp, lineHeight = 17.sp)
++        }
++        Spacer(modifier = Modifier.width(12.dp))
++        Switch(
++            checked = checked,
++            onCheckedChange = onChecked,
++            colors = SwitchDefaults.colors(
++                checkedThumbColor = Color.White,
++                checkedTrackColor = NeonCyan,
++                uncheckedThumbColor = Color.Gray,
++                uncheckedTrackColor = Color.White.copy(alpha = 0.1f)
++            )
++        )
++    }
++}
++
++@Composable
++private fun TranslationOptionsCard(viewModel: SettingsViewModel) {
++    val subtitles by viewModel.subtitlesEnabled.collectAsState()
++    val showOriginal by viewModel.showOriginal.collectAsState()
++    val karaoke by viewModel.karaoke.collectAsState()
++    val liteMode by viewModel.liteMode.collectAsState()
++    val subtitleSize by viewModel.subtitleSize.collectAsState()
++
++    GlassCard(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp)) {
++        Column(modifier = Modifier.padding(20.dp)) {
++            SectionHeader(Icons.Default.ClosedCaption, stringResource(R.string.settings_translation))
++            Spacer(modifier = Modifier.height(8.dp))
++            ToggleRow(
++                stringResource(R.string.opt_subtitles),
++                stringResource(R.string.opt_subtitles_desc),
++                subtitles, viewModel::updateSubtitlesEnabled
++            )
++            ToggleRow(
++                stringResource(R.string.opt_show_original),
++                stringResource(R.string.opt_show_original_desc),
++                showOriginal, viewModel::updateShowOriginal
++            )
++            ToggleRow(
++                stringResource(R.string.opt_karaoke),
++                stringResource(R.string.opt_karaoke_desc),
++                karaoke, viewModel::updateKaraoke
++            )
++            ToggleRow(
++                stringResource(R.string.opt_lite_mode),
++                stringResource(R.string.opt_lite_mode_desc),
++                liteMode, viewModel::updateLiteMode
++            )
++            Spacer(modifier = Modifier.height(4.dp))
++            Text(
++                stringResource(R.string.opt_subtitle_size),
++                color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Medium
++            )
++            Slider(
++                value = subtitleSize,
++                onValueChange = viewModel::updateSubtitleSize,
++                valueRange = 0.7f..1.6f,
++                colors = SliderDefaults.colors(thumbColor = NeonCyan, activeTrackColor = NeonCyan)
++            )
++        }
++    }
++}
++
++@Composable
++private fun AudioOptionsCard(viewModel: SettingsViewModel) {
++    val audioSource by viewModel.audioSource.collectAsState()
++    val skipSilence by viewModel.skipSilence.collectAsState()
++    val useMic = audioSource == com.alad.app.data.repository.UserPreferencesRepository.AUDIO_SOURCE_MIC
++
++    GlassCard(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp)) {
++        Column(modifier = Modifier.padding(20.dp)) {
++            SectionHeader(Icons.Default.Mic, stringResource(R.string.settings_audio))
++            Spacer(modifier = Modifier.height(12.dp))
++
++            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
++                val internalSelected = !useMic
++                Box(
++                    modifier = Modifier
++                        .weight(1f)
++                        .clip(RoundedCornerShape(14.dp))
++                        .background(
++                            if (internalSelected) NeonCyan.copy(alpha = 0.18f)
++                            else Color.White.copy(alpha = 0.05f)
++                        )
++                        .border(
++                            1.dp,
++                            if (internalSelected) NeonCyan else Color.White.copy(alpha = 0.12f),
++                            RoundedCornerShape(14.dp)
++                        )
++                        .clickable {
++                            viewModel.updateAudioSource(
++                                com.alad.app.data.repository.UserPreferencesRepository.AUDIO_SOURCE_INTERNAL
++                            )
++                        }
++                        .padding(12.dp),
++                    contentAlignment = Alignment.Center
++                ) {
++                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
++                        Text(
++                            stringResource(R.string.opt_audio_internal),
++                            color = if (internalSelected) NeonCyan else Color.White,
++                            fontWeight = FontWeight.Bold, fontSize = 13.sp
++                        )
++                        Text(
++                            stringResource(R.string.opt_audio_internal_desc),
++                            color = TextSecondary, fontSize = 11.sp, textAlign = androidx.compose.ui.text.style.TextAlign.Center
++                        )
++                    }
++                }
++                Box(
++                    modifier = Modifier
++                        .weight(1f)
++                        .clip(RoundedCornerShape(14.dp))
++                        .background(
++                            if (useMic) NeonCyan.copy(alpha = 0.18f)
++                            else Color.White.copy(alpha = 0.05f)
++                        )
++                        .border(
++                            1.dp,
++                            if (useMic) NeonCyan else Color.White.copy(alpha = 0.12f),
++                            RoundedCornerShape(14.dp)
++                        )
++                        .clickable {
++                            viewModel.updateAudioSource(
++                                com.alad.app.data.repository.UserPreferencesRepository.AUDIO_SOURCE_MIC
++                            )
++                        }
++                        .padding(12.dp),
++                    contentAlignment = Alignment.Center
++                ) {
++                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
++                        Text(
++                            stringResource(R.string.opt_audio_mic),
++                            color = if (useMic) NeonCyan else Color.White,
++                            fontWeight = FontWeight.Bold, fontSize = 13.sp
++                        )
++                        Text(
++                            stringResource(R.string.opt_audio_mic_desc),
++                            color = TextSecondary, fontSize = 11.sp, textAlign = androidx.compose.ui.text.style.TextAlign.Center
++                        )
++                    }
++                }
++            }
++
++            ToggleRow(
++                stringResource(R.string.opt_skip_silence),
++                stringResource(R.string.opt_skip_silence_desc),
++                skipSilence, viewModel::updateSkipSilence
++            )
++        }
++    }
++}
++
++@Composable
++private fun ShadowingOptionsCard(viewModel: SettingsViewModel) {
++    val context = LocalContext.current
++    val shadowMode by viewModel.shadowMode.collectAsState()
++    val autopause by viewModel.shadowAutopause.collectAsState()
++    val obsidianUri by viewModel.obsidianUri.collectAsState()
++
++    val vaultPicker = rememberLauncherForActivityResult(
++        ActivityResultContracts.OpenDocumentTree()
++    ) { uri ->
++        if (uri != null) {
++            try {
++                context.contentResolver.takePersistableUriPermission(
++                    uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
++                )
++                viewModel.updateObsidianUri(uri.toString())
++            } catch (_: Exception) { }
++        }
++    }
++
++    GlassCard(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp)) {
++        Column(modifier = Modifier.padding(20.dp)) {
++            SectionHeader(Icons.Default.RecordVoiceOver, stringResource(R.string.settings_shadowing))
++            Spacer(modifier = Modifier.height(8.dp))
++            ToggleRow(
++                stringResource(R.string.opt_shadow_mode),
++                stringResource(R.string.opt_shadow_mode_desc),
++                shadowMode, viewModel::updateShadowMode
++            )
++            ToggleRow(
++                stringResource(R.string.opt_shadow_autopause),
++                stringResource(R.string.opt_shadow_autopause_desc),
++                autopause, viewModel::updateShadowAutopause
++            )
++            Spacer(modifier = Modifier.height(8.dp))
++            Text(
++                stringResource(R.string.opt_obsidian),
++                color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Medium
++            )
++            Text(
++                stringResource(R.string.opt_obsidian_desc),
++                color = TextSecondary, fontSize = 12.sp, lineHeight = 17.sp
++            )
++            Spacer(modifier = Modifier.height(10.dp))
++            Box(
++                modifier = Modifier
++                    .fillMaxWidth()
++                    .clip(RoundedCornerShape(14.dp))
++                    .background(
++                        if (obsidianUri.isNotBlank()) NeonCyan.copy(alpha = 0.12f)
++                        else Color.White.copy(alpha = 0.05f)
++                    )
++                    .border(
++                        1.dp,
++                        if (obsidianUri.isNotBlank()) NeonCyan else Color.White.copy(alpha = 0.12f),
++                        RoundedCornerShape(14.dp)
++                    )
++                    .clickable { vaultPicker.launch(null) }
++                    .padding(horizontal = 16.dp, vertical = 12.dp)
++            ) {
++                Row(verticalAlignment = Alignment.CenterVertically) {
++                    Icon(
++                        Icons.Default.FolderOpen, contentDescription = null,
++                        tint = if (obsidianUri.isNotBlank()) NeonCyan else TextSecondary,
++                        modifier = Modifier.size(20.dp)
++                    )
++                    Spacer(modifier = Modifier.width(10.dp))
++                    Text(
++                        if (obsidianUri.isNotBlank()) stringResource(R.string.opt_obsidian_connected)
++                        else stringResource(R.string.opt_obsidian_pick),
++                        color = if (obsidianUri.isNotBlank()) NeonCyan else Color.White,
++                        fontSize = 13.sp, fontWeight = FontWeight.Medium
++                    )
++                }
++            }
++        }
+     }
+ }
+diff -ruN '--exclude=build' '--exclude=.gradle' ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/presentation/settings/SettingsViewModel.kt ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/presentation/settings/SettingsViewModel.kt
+--- ALAD-Mobile-main/app/src/main/kotlin/com/alad/app/presentation/settings/SettingsViewModel.kt	2026-08-28 19:18:21.000000000 +0330
++++ ALAD-Mobile-pazhvak/app/src/main/kotlin/com/alad/app/presentation/settings/SettingsViewModel.kt	2026-10-17 22:10:32.741559262 +0330
+@@ -13,24 +13,85 @@
+ class SettingsViewModel(private val repository: UserPreferencesRepository) : ViewModel() {
+     private val _apiKey = MutableStateFlow("")
+     val apiKey: StateFlow<String> = _apiKey.asStateFlow()
+-    
++
+     private val _volumeRatio = MutableStateFlow(1.0f)
+     val volumeRatio: StateFlow<Float> = _volumeRatio.asStateFlow()
+ 
++    // --- Pazhvak-parity options ---
++    private val _subtitlesEnabled = MutableStateFlow(true)
++    val subtitlesEnabled: StateFlow<Boolean> = _subtitlesEnabled.asStateFlow()
++
++    private val _showOriginal = MutableStateFlow(false)
++    val showOriginal: StateFlow<Boolean> = _showOriginal.asStateFlow()
++
++    private val _karaoke = MutableStateFlow(false)
++    val karaoke: StateFlow<Boolean> = _karaoke.asStateFlow()
++
++    private val _liteMode = MutableStateFlow(false)
++    val liteMode: StateFlow<Boolean> = _liteMode.asStateFlow()
++
++    private val _shadowMode = MutableStateFlow(false)
++    val shadowMode: StateFlow<Boolean> = _shadowMode.asStateFlow()
++
++    private val _shadowAutopause = MutableStateFlow(true)
++    val shadowAutopause: StateFlow<Boolean> = _shadowAutopause.asStateFlow()
++
++    private val _audioSource = MutableStateFlow(UserPreferencesRepository.AUDIO_SOURCE_INTERNAL)
++    val audioSource: StateFlow<String> = _audioSource.asStateFlow()
++
++    private val _skipSilence = MutableStateFlow(true)
++    val skipSilence: StateFlow<Boolean> = _skipSilence.asStateFlow()
++
++    private val _obsidianUri = MutableStateFlow("")
++    val obsidianUri: StateFlow<String> = _obsidianUri.asStateFlow()
++
++    private val _subtitleSize = MutableStateFlow(1.0f)
++    val subtitleSize: StateFlow<Float> = _subtitleSize.asStateFlow()
++
+     init {
+         viewModelScope.launch {
+             _apiKey.value = repository.apiKeyFlow.first()
+             _volumeRatio.value = repository.volumeRatioFlow.first()
++            _subtitlesEnabled.value = repository.subtitlesEnabledFlow.first()
++            _showOriginal.value = repository.showOriginalFlow.first()
++            _karaoke.value = repository.karaokeFlow.first()
++            _liteMode.value = repository.liteModeFlow.first()
++            _shadowMode.value = repository.shadowModeFlow.first()
++            _shadowAutopause.value = repository.shadowAutopauseFlow.first()
++            _audioSource.value = repository.audioSourceFlow.first()
++            _skipSilence.value = repository.skipSilenceFlow.first()
++            _obsidianUri.value = repository.obsidianUriFlow.first()
++            _subtitleSize.value = repository.subtitleSizeFlow.first()
+         }
+     }
+ 
+     fun updateApiKey(key: String) { _apiKey.value = key }
+     fun updateVolumeRatio(ratio: Float) { _volumeRatio.value = ratio }
++    fun updateSubtitlesEnabled(v: Boolean) { _subtitlesEnabled.value = v }
++    fun updateShowOriginal(v: Boolean) { _showOriginal.value = v }
++    fun updateKaraoke(v: Boolean) { _karaoke.value = v }
++    fun updateLiteMode(v: Boolean) { _liteMode.value = v }
++    fun updateShadowMode(v: Boolean) { _shadowMode.value = v }
++    fun updateShadowAutopause(v: Boolean) { _shadowAutopause.value = v }
++    fun updateAudioSource(v: String) { _audioSource.value = v }
++    fun updateSkipSilence(v: Boolean) { _skipSilence.value = v }
++    fun updateObsidianUri(v: String) { _obsidianUri.value = v }
++    fun updateSubtitleSize(v: Float) { _subtitleSize.value = v }
+ 
+     fun saveSettings() {
+         viewModelScope.launch {
+             repository.updateApiKey(_apiKey.value)
+             repository.updateVolumeRatio(_volumeRatio.value)
++            repository.updateSubtitlesEnabled(_subtitlesEnabled.value)
++            repository.updateShowOriginal(_showOriginal.value)
++            repository.updateKaraoke(_karaoke.value)
++            repository.updateLiteMode(_liteMode.value)
++            repository.updateShadowMode(_shadowMode.value)
++            repository.updateShadowAutopause(_shadowAutopause.value)
++            repository.updateAudioSource(_audioSource.value)
++            repository.updateSkipSilence(_skipSilence.value)
++            repository.updateObsidianUri(_obsidianUri.value)
++            repository.updateSubtitleSize(_subtitleSize.value)
+         }
+     }
+ }
+diff -ruN '--exclude=build' '--exclude=.gradle' ALAD-Mobile-main/app/src/main/res/values/strings.xml ALAD-Mobile-pazhvak/app/src/main/res/values/strings.xml
+--- ALAD-Mobile-main/app/src/main/res/values/strings.xml	2026-08-28 19:18:21.000000000 +0330
++++ ALAD-Mobile-pazhvak/app/src/main/res/values/strings.xml	2026-10-17 22:10:32.763559261 +0330
+@@ -26,4 +26,34 @@
+     <string name="help_title">How to use ALAD</string>
+     <string name="help_content">1. Go to settings and set your Gemini API Key.\n2. Choose your target language.\n3. Tap \'Start Dubbing\' to begin real-time translation.\n4. Use the floating widget to control dubbing while using other apps.</string>
+     <string name="close">Close</string>
++    <string name="tile_label">ALAD Dub</string>
++    <string name="settings_translation">Translation</string>
++    <string name="opt_subtitles">Floating subtitles</string>
++    <string name="opt_subtitles_desc">Translated text over YouTube and any other app</string>
++    <string name="opt_show_original">Show original text</string>
++    <string name="opt_show_original_desc">The source sentence above the translation</string>
++    <string name="opt_karaoke">Word-by-word highlight</string>
++    <string name="opt_karaoke_desc">The word being spoken glows in the subtitle</string>
++    <string name="opt_lite_mode">Lite subtitles</string>
++    <string name="opt_lite_mode_desc">For slow networks: about 10x less data, subtitles only, no voice</string>
++    <string name="opt_subtitle_size">Subtitle text size</string>
++    <string name="settings_audio">Audio</string>
++    <string name="opt_audio_internal">Phone audio</string>
++    <string name="opt_audio_internal_desc">Translate videos and apps playing on this phone</string>
++    <string name="opt_audio_mic">Around me</string>
++    <string name="opt_audio_mic_desc">Translate people talking around the phone</string>
++    <string name="opt_skip_silence">Save quota</string>
++    <string name="opt_skip_silence_desc">No audio is sent while the video is paused</string>
++    <string name="settings_shadowing">Shadowing (practice)</string>
++    <string name="opt_shadow_mode">Shadowing for learners</string>
++    <string name="opt_shadow_mode_desc">The original sentence large, with replay, slow and save buttons — listen and repeat along</string>
++    <string name="opt_shadow_autopause">Auto-pause video</string>
++    <string name="opt_shadow_autopause_desc">After each sentence the video pauses for a few seconds so you can say it out loud</string>
++    <string name="opt_obsidian">Obsidian vault</string>
++    <string name="opt_obsidian_desc">Save shadowing sentences as review cards in your Obsidian vault</string>
++    <string name="opt_obsidian_pick">Choose Obsidian vault folder</string>
++    <string name="opt_obsidian_connected">Vault connected — tap to change</string>
++    <string name="badge_lite">Lite</string>
++    <string name="badge_shadow">Shadow</string>
++    <string name="badge_mic">Around me</string>
+ </resources>
+diff -ruN '--exclude=build' '--exclude=.gradle' ALAD-Mobile-main/app/src/main/res/values-fa/strings.xml ALAD-Mobile-pazhvak/app/src/main/res/values-fa/strings.xml
+--- ALAD-Mobile-main/app/src/main/res/values-fa/strings.xml	2026-08-28 19:18:21.000000000 +0330
++++ ALAD-Mobile-pazhvak/app/src/main/res/values-fa/strings.xml	2026-10-17 22:10:32.762559261 +0330
+@@ -26,4 +26,34 @@
+     <string name="help_title">راهنمای استفاده از ALAD</string>
+     <string name="help_content">۱. به تنظیمات بروید و کلید API خود را وارد کنید.\n۲. زبان مقصد را انتخاب کنید.\n۳. روی «شروع دوبله» کلیک کنید تا ترجمه همزمان آغاز شود.\n۴. از ویجت شناور برای کنترل برنامه هنگام استفاده از برنامه‌های دیگر استفاده کنید.</string>
+     <string name="close">بستن</string>
++    <string name="tile_label">دوبله ALAD</string>
++    <string name="settings_translation">ترجمه</string>
++    <string name="opt_subtitles">زیرنویس شناور</string>
++    <string name="opt_subtitles_desc">متن ترجمه‌شده روی یوتیوب و هر اپ دیگر</string>
++    <string name="opt_show_original">نمایش متن اصلی</string>
++    <string name="opt_show_original_desc">جملهٔ اصلی بالای ترجمه نمایش داده می‌شود</string>
++    <string name="opt_karaoke">هایلایت کلمه‌به‌کلمه</string>
++    <string name="opt_karaoke_desc">کلمه‌ای که در حال گفته شدن است در زیرنویس می‌درخشد</string>
++    <string name="opt_lite_mode">زیرنویس سبک</string>
++    <string name="opt_lite_mode_desc">برای اینترنت ضعیف: حدود ۱۰ برابر دادهٔ کمتر، فقط زیرنویس بدون صدا</string>
++    <string name="opt_subtitle_size">اندازهٔ متن زیرنویس</string>
++    <string name="settings_audio">صدا</string>
++    <string name="opt_audio_internal">صدای گوشی</string>
++    <string name="opt_audio_internal_desc">ترجمهٔ ویدیوها و اپ‌های در حال پخش در همین گوشی</string>
++    <string name="opt_audio_mic">اطراف من</string>
++    <string name="opt_audio_mic_desc">ترجمهٔ صحبت افراد اطراف گوشی</string>
++    <string name="opt_skip_silence">صرفه‌جویی در سهمیه</string>
++    <string name="opt_skip_silence_desc">وقتی ویدیو متوقف است صدایی ارسال نمی‌شود</string>
++    <string name="settings_shadowing">شدویینگ (تمرین)</string>
++    <string name="opt_shadow_mode">شدویینگ برای زبان‌آموزان</string>
++    <string name="opt_shadow_mode_desc">جملهٔ اصلی بزرگ، با دکمه‌های پخش مجدد، کند و ذخیره — گوش کن و تکرار کن</string>
++    <string name="opt_shadow_autopause">توقف خودکار ویدیو</string>
++    <string name="opt_shadow_autopause_desc">بعد از هر جمله ویدیو چند ثانیه متوقف می‌شود تا بلند تکرار کنی</string>
++    <string name="opt_obsidian">والْت Obsidian</string>
++    <string name="opt_obsidian_desc">ذخیرهٔ جمله‌های شدویینگ به‌صورت کارت مرور در والْت Obsidian</string>
++    <string name="opt_obsidian_pick">انتخاب پوشهٔ والْت Obsidian</string>
++    <string name="opt_obsidian_connected">والْت متصل است — برای تغییر بزن</string>
++    <string name="badge_lite">سبک</string>
++    <string name="badge_shadow">شدویینگ</string>
++    <string name="badge_mic">اطراف من</string>
+ </resources>
+Binary files ALAD-Mobile-main/gradle.properties and ALAD-Mobile-pazhvak/gradle.properties differ

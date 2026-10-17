@@ -70,9 +70,49 @@ class AudioCaptureManager {
         }
     }
 
+    /**
+     * "Around-me" mode: capture from the microphone instead of internal playback,
+     * for translating the room / people around the phone.
+     */
+    @SuppressLint("MissingPermission")
+    fun startMicCapture(onAudioData: (ByteArray) -> Unit) {
+        if (isRecording) return
+
+        try {
+            val format = AudioFormat.Builder()
+                .setEncoding(AUDIO_FORMAT)
+                .setSampleRate(SAMPLE_RATE)
+                .setChannelMask(CHANNEL_CONFIG)
+                .build()
+
+            audioRecord = AudioRecord.Builder()
+                .setAudioSource(android.media.MediaRecorder.AudioSource.MIC)
+                .setAudioFormat(format)
+                .setBufferSizeInBytes(BUFFER_SIZE)
+                .build()
+
+            audioRecord?.startRecording()
+            isRecording = true
+
+            Thread {
+                val buffer = ByteArray(BUFFER_SIZE)
+                while (isRecording) {
+                    val read = audioRecord?.read(buffer, 0, buffer.size) ?: 0
+                    if (read > 0) {
+                        onAudioData(buffer.copyOf(read))
+                    }
+                }
+            }.start()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error starting mic capture", e)
+        }
+    }
+
     fun stopCapture() {
         isRecording = false
-        audioRecord?.stop()
+        try {
+            audioRecord?.stop()
+        } catch (_: Exception) { }
         audioRecord?.release()
         audioRecord = null
     }
